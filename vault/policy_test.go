@@ -440,7 +440,7 @@ path "/" {
 
 func TestPolicy_ParseBadPolicy(t *testing.T) {
 	_, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
-path "/" {
+path "/foo" {
 	policy = "banana"
 }
 `))
@@ -448,14 +448,14 @@ path "/" {
 		t.Fatalf("expected error")
 	}
 
-	if !strings.Contains(err.Error(), `path "/": invalid policy "banana"`) {
+	if !strings.Contains(err.Error(), `path "/foo": invalid policy "banana"`) {
 		t.Errorf("bad error: %s", err)
 	}
 }
 
 func TestPolicy_ParseBadWrapping(t *testing.T) {
 	_, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
-path "/" {
+path "/foo" {
 	policy = "read"
 	min_wrapping_ttl = 400
 	max_wrapping_ttl = 200
@@ -472,7 +472,7 @@ path "/" {
 
 func TestPolicy_ParseBadCapabilities(t *testing.T) {
 	_, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
-path "/" {
+path "/foo" {
 	capabilities = ["read", "banana"]
 }
 `))
@@ -480,7 +480,7 @@ path "/" {
 		t.Fatalf("expected error")
 	}
 
-	if !strings.Contains(err.Error(), `path "/": invalid capability "banana"`) {
+	if !strings.Contains(err.Error(), `path "/foo": invalid capability "banana"`) {
 		t.Errorf("bad error: %s", err)
 	}
 }
@@ -515,6 +515,92 @@ path "foo/+*" {
 
 	if !strings.Contains(err.Error(), `path "foo/+*": invalid use of wildcards ('+*' is forbidden)`) {
 		t.Errorf("bad error: %s", err)
+	}
+}
+
+// TestPolicy_ParseInvalidPaths ensures that policy paths which could alias or
+// bypass other rules — empty paths, encoded slashes, duplicate separators,
+// and misplaced wildcards — are rejected at parse time.
+func TestPolicy_ParseInvalidPaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		wantErr string
+	}{
+		{"empty", ``, "path is empty"},
+		{"root only", `/`, "path is empty"},
+		{"encoded slash lower", `secret%2ffoo`, "encoded slashes"},
+		{"encoded slash upper", `secret%2Ffoo`, "encoded slashes"},
+		{"encoded slash mixed", `secret/foo%2Fbar`, "encoded slashes"},
+		{"duplicate separator", `secret//foo`, "duplicate path separators"},
+		{"duplicate separator only", `//`, "path is empty"},
+		{"interior glob", `secret/foo*bar`, "'*' is only allowed at the end"},
+		{"leading glob", `*/foo`, "'*' is only allowed at the end"},
+		{"multiple globs", `secret/*/foo/*`, "multiple '*' is forbidden"},
+		{"plus glob combo", `secret/+*`, "'+*' is forbidden"},
+		{"plus prefix of segment", `secret/+foo`, "'+' is not allowed next to a non-slash"},
+		{"plus suffix of segment", `secret/foo+`, "'+' is not allowed next to a non-slash"},
+		{"plus inside segment", `secret/fo+o/bar`, "'+' is not allowed next to a non-slash"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rules := `path "` + tc.path + `" {
+	capabilities = ["read"]
+}`
+			_, err := ParseACLPolicy(namespace.RootNamespace, rules)
+			if err == nil {
+				t.Fatalf("expected error for path %q", tc.path)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("path %q: expected error containing %q, got: %v", tc.path, tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestPolicy_ParseValidPaths ensures that legitimate path shapes — exact,
+// trailing glob, segment wildcards, and the global glob — still parse.
+func TestPolicy_ParseValidPaths(t *testing.T) {
+	cases := []struct {
+		path                string
+		wantNormalized      string
+		wantIsPrefix        bool
+		wantSegmentWildcard bool
+	}{
+		{"secret/foo", "secret/foo", false, false},
+		{"/secret/foo", "secret/foo", false, false},
+		{"secret/foo/*", "secret/foo/", true, false},
+		{"*", "", true, false},
+		{"secret/+", "secret/+", false, true},
+		{"+", "+", false, true},
+		{"secret/+/foo", "secret/+/foo", false, true},
+		{"secret/+/foo/*", "secret/+/foo/*", false, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			rules := `path "` + tc.path + `" {
+	capabilities = ["read"]
+}`
+			policy, err := ParseACLPolicy(namespace.RootNamespace, rules)
+			if err != nil {
+				t.Fatalf("path %q: unexpected error: %v", tc.path, err)
+			}
+			if len(policy.Paths) != 1 {
+				t.Fatalf("path %q: expected 1 path rule, got %d", tc.path, len(policy.Paths))
+			}
+			pr := policy.Paths[0]
+			if pr.Path != tc.wantNormalized {
+				t.Errorf("path %q: expected normalized path %q, got %q", tc.path, tc.wantNormalized, pr.Path)
+			}
+			if pr.IsPrefix != tc.wantIsPrefix {
+				t.Errorf("path %q: expected IsPrefix=%v, got %v", tc.path, tc.wantIsPrefix, pr.IsPrefix)
+			}
+			if pr.HasSegmentWildcards != tc.wantSegmentWildcard {
+				t.Errorf("path %q: expected HasSegmentWildcards=%v, got %v", tc.path, tc.wantSegmentWildcard, pr.HasSegmentWildcards)
+			}
+		})
 	}
 }
 

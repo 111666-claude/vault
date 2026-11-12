@@ -2064,3 +2064,55 @@ type staticSalt struct {
 func (s *staticSalt) Salt(_ context.Context) (*salt.Salt, error) {
 	return s.salt, nil
 }
+
+// TestEntryFormatter_Process_RequestDataNeverPlaintext ensures that sensitive
+// request data values are HMAC'd in the formatted audit entry and never
+// appear in plaintext, regardless of the request path or operation.
+func TestEntryFormatter_Process_RequestDataNeverPlaintext(t *testing.T) {
+	t.Parallel()
+
+	ss := newStaticSalt(t)
+	cfg, err := newFormatterConfig(&testHeaderFormatter{}, nil)
+	require.NoError(t, err)
+	f, err := newEntryFormatter("juan", cfg, ss, hclog.NewNullLogger())
+	require.NoError(t, err)
+
+	const secretValue = "super-secret-value-12345"
+	const tokenValue = "hvs.sensitive-token-value"
+
+	auditEvent, err := newEvent(RequestType)
+	require.NoError(t, err)
+	auditEvent.Data = &logical.LogInput{
+		Request: &logical.Request{
+			ID:        "123",
+			Operation: logical.UpdateOperation,
+			Path:      "secret/data/foo",
+			Data: map[string]interface{}{
+				"password": secretValue,
+				"token":    tokenValue,
+			},
+		},
+	}
+
+	e := &eventlogger.Event{
+		Type:      event.AuditType.AsEventType(),
+		CreatedAt: time.Now(),
+		Formatted: make(map[string][]byte),
+		Payload:   auditEvent,
+	}
+
+	e2, err := f.Process(nshelper.RootContext(context.Background()), e)
+	require.NoError(t, err)
+	require.NotNil(t, e2)
+
+	b, ok := e2.Format(jsonFormat.String())
+	require.True(t, ok)
+
+	// The plaintext sensitive values must never appear in the audit entry.
+	require.NotContains(t, string(b), secretValue)
+	require.NotContains(t, string(b), tokenValue)
+
+	// The values must instead appear in their HMAC'd form.
+	require.Contains(t, string(b), ss.salt.GetIdentifiedHMAC(secretValue))
+	require.Contains(t, string(b), ss.salt.GetIdentifiedHMAC(tokenValue))
+}

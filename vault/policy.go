@@ -568,21 +568,71 @@ func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, en
 	return nil
 }
 
+// hasEncodedSlash reports whether s contains a percent-encoded slash
+// ("%2f" in any casing). Encoded slashes are rejected in policy and request
+// paths because upstream and downstream layers decode them at different
+// times, which would let one layer's "a%2fb" become another layer's "a/b"
+// and alias a rule the policy author never wrote.
+func hasEncodedSlash(s string) bool {
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] == '%' && s[i+1] == '2' && (s[i+2] == 'f' || s[i+2] == 'F') {
+			return true
+		}
+	}
+	return false
+}
+
+// validatePolicyPath rejects policy paths that could alias or bypass other
+// rules: empty paths, encoded slashes, duplicate separators, and misplaced
+// wildcards. The wildcard rules mirror the mount-path validation in
+// router.go (isValidSpecialPath) so that a shape which cannot be mounted
+// cannot be granted by a policy either.
+func validatePolicyPath(path string) error {
+	switch {
+	case path == "":
+		return errors.New("path is empty")
+	case hasEncodedSlash(path):
+		return errors.New("encoded slashes ('%2f') are not allowed in a path")
+	case strings.Contains(path, "//"):
+		return errors.New("duplicate path separators ('//') are not allowed")
+	case strings.Contains(path, "+*"):
+		return errors.New("invalid use of wildcards ('+*' is forbidden)")
+	case strings.Count(path, "*") > 1:
+		return errors.New("invalid use of wildcards (multiple '*' is forbidden)")
+	case strings.Contains(path, "*") && path[len(path)-1] != '*':
+		return errors.New("invalid use of wildcards ('*' is only allowed at the end of a path)")
+	case wcAdjacentNonSlashRegEx(path):
+		return errors.New("invalid use of wildcards ('+' is not allowed next to a non-slash)")
+	}
+	return nil
+}
+
 // normalizePath converts pr.Path from a path written relative to ns into the
 // fully-qualified form that ACL matching uses. It strips a leading '/',
-// prefixes the namespace path, rejects '+*', and records whether the path has
+// prefixes the namespace path, rejects paths that could alias or bypass
+// other rules (see validatePolicyPath), and records whether the path has
 // segment wildcards or a trailing glob.
 func (pr *PathRules) normalizePath(ns *namespace.Namespace) error {
-	// Strip a leading '/' as paths in Vault start after the / in the API path
-	if len(pr.Path) > 0 && pr.Path[0] == '/' {
+	// Strip leading '/' characters as paths in Vault start after the / in
+	// the API path. Stripping all of them (rather than just one) keeps a
+	// path like "//secret" from turning into a rule containing a duplicate
+	// separator, and mirrors the request-side normalization in acl.go.
+	for len(pr.Path) > 0 && pr.Path[0] == '/' {
 		pr.Path = pr.Path[1:]
+	}
+
+	// An empty path can never be a legitimate grant: as an exact rule it is
+	// unreachable, and rejecting it here keeps a bare "" or "/" stanza from
+	// silently doing nothing while looking like it protects something.
+	if pr.Path == "" {
+		return fmt.Errorf("path %q: %w", pr.Path, errors.New("path is empty"))
 	}
 
 	// Ensure we are using the full request path internally
 	pr.Path = ns.Path + pr.Path
 
-	if strings.Contains(pr.Path, "+*") {
-		return fmt.Errorf("path %q: invalid use of wildcards ('+*' is forbidden)", pr.Path)
+	if err := validatePolicyPath(pr.Path); err != nil {
+		return fmt.Errorf("path %q: %w", pr.Path, err)
 	}
 
 	if pr.Path == "+" || strings.Count(pr.Path, "/+") > 0 || strings.HasPrefix(pr.Path, "+/") {

@@ -501,6 +501,23 @@ func (a *ACL) Capabilities(ctx context.Context, path string) []string {
 	return pathCapabilities
 }
 
+// normalizeACLRequestPath produces the canonical request path used for all
+// ACL rule lookups. It strips leading '/' characters (the HTTP layer has
+// normally done this already; this is defense in depth and helps tests) and
+// reports ok=false for paths that must be denied outright because they could
+// alias a different policy rule: percent-encoded slashes and duplicate
+// separators. An empty path is not an error — it simply matches no exact
+// rule, though a global "*" prefix rule may still apply to it.
+func normalizeACLRequestPath(path string) (string, bool) {
+	for len(path) > 0 && path[0] == '/' {
+		path = path[1:]
+	}
+	if hasEncodedSlash(path) || strings.Contains(path, "//") {
+		return "", false
+	}
+	return path, true
+}
+
 // AllowOperation is used to check if the given operation is permitted.
 func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheckOnly bool) (ret *ACLResults) {
 	ret = a.performEnterpriseAclChecks(ctx, req, capCheckOnly)
@@ -538,16 +555,16 @@ func (a *ACL) AllowOperation(ctx context.Context, req *logical.Request, capCheck
 	if err != nil {
 		return
 	}
-	path := ns.Path + req.Path
 
-	// The request path should take care of this already but this is useful for
-	// tests and as defense in depth
-	for {
-		if len(path) > 0 && path[0] == '/' {
-			path = path[1:]
-		} else {
-			break
-		}
+	// Normalize the request path exactly once and use the resulting form for
+	// every operation (read, list, update, delete, ...), so that all
+	// capabilities are evaluated against the same canonical path. Paths that
+	// could alias a different rule — percent-encoded slashes or duplicate
+	// separators — are denied outright rather than matched against a cleaned
+	// form that the policy author never wrote.
+	path, pathOK := normalizeACLRequestPath(ns.Path + req.Path)
+	if !pathOK {
+		return
 	}
 
 	// Find an exact matching rule, look for prefix if no match

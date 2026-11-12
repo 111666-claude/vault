@@ -2871,3 +2871,300 @@ func TestAllowedAndDeniedParameters(t *testing.T) {
 		})
 	}
 }
+
+// testACLFromRules parses rules as a single ACL policy in the root namespace
+// and compiles it into an ACL.
+func testACLFromRules(t *testing.T, rules string) *ACL {
+	t.Helper()
+	policy, err := ParseACLPolicy(namespace.RootNamespace, rules)
+	require.NoError(t, err)
+	acl, err := NewACL(namespace.RootContext(context.Background()), []*Policy{policy})
+	require.NoError(t, err)
+	return acl
+}
+
+// testACLAllowed reports whether acl allows op on path.
+func testACLAllowed(t *testing.T, acl *ACL, op logical.Operation, path string) bool {
+	t.Helper()
+	res := acl.AllowOperation(namespace.RootContext(context.Background()), &logical.Request{
+		Operation: op,
+		Path:      path,
+	}, false)
+	require.NotNil(t, res)
+	return res.Allowed
+}
+
+// TestACL_AdjacentPathsNoCrossAuthorization ensures that rules for a path do
+// not bleed into adjacent, prefix-similar paths: an exact rule for
+// "secret/foo" must not match "secret/foobar", and a prefix rule for
+// "secret/foo/*" must not match "secret/foobar" either.
+func TestACL_AdjacentPathsNoCrossAuthorization(t *testing.T) {
+	t.Parallel()
+
+	acl := testACLFromRules(t, `
+path "secret/foo" {
+	capabilities = ["read"]
+}
+path "secret/foo/*" {
+	capabilities = ["update"]
+}
+`)
+
+	cases := []struct {
+		name    string
+		op      logical.Operation
+		path    string
+		allowed bool
+	}{
+		{"exact rule matches its own path", logical.ReadOperation, "secret/foo", true},
+		{"exact rule does not match adjacent name", logical.ReadOperation, "secret/foobar", false},
+		{"exact rule does not match name prefix", logical.ReadOperation, "secret/fo", false},
+		{"prefix rule matches child", logical.UpdateOperation, "secret/foo/bar", true},
+		{"prefix rule does not match adjacent name", logical.UpdateOperation, "secret/foobar", false},
+		{"prefix rule does not match adjacent child", logical.UpdateOperation, "secret/foobar/baz", false},
+		{"prefix rule does not grant unlisted capability", logical.ReadOperation, "secret/foo/bar", false},
+		{"exact rule does not grant unlisted capability", logical.DeleteOperation, "secret/foo", false},
+		{"unrelated path denied", logical.ReadOperation, "secret/other", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.allowed, testACLAllowed(t, acl, tc.op, tc.path),
+				"op=%s path=%q", tc.op, tc.path)
+		})
+	}
+}
+
+// TestACL_MalformedRequestPathsDenied ensures that request paths carrying
+// encoded slashes or duplicate separators are denied outright, even when a
+// broad prefix rule would otherwise match the cleaned or literal form.
+func TestACL_MalformedRequestPathsDenied(t *testing.T) {
+	t.Parallel()
+
+	acl := testACLFromRules(t, `
+path "secret/*" {
+	capabilities = ["read", "list"]
+}
+`)
+
+	cases := []struct {
+		name    string
+		op      logical.Operation
+		path    string
+		allowed bool
+	}{
+		{"plain path allowed", logical.ReadOperation, "secret/foo", true},
+		{"leading slash stripped", logical.ReadOperation, "/secret/foo", true},
+		{"encoded slash lower", logical.ReadOperation, "secret/foo%2fbar", false},
+		{"encoded slash upper", logical.ReadOperation, "secret/foo%2Fbar", false},
+		{"encoded slash at start", logical.ReadOperation, "%2fsecret/foo", false},
+		{"encoded slash only segment", logical.ReadOperation, "secret/%2f", false},
+		{"duplicate separator", logical.ReadOperation, "secret//foo", false},
+		{"duplicate separator deep", logical.ReadOperation, "secret/foo//bar", false},
+		{"list with duplicate separator", logical.ListOperation, "secret//", false},
+		{"unmatched path denied", logical.ReadOperation, "other/foo", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.allowed, testACLAllowed(t, acl, tc.op, tc.path),
+				"op=%s path=%q", tc.op, tc.path)
+		})
+	}
+}
+
+// TestACL_UniformNormalizationAcrossOperations ensures that read, list,
+// update, and delete all evaluate the same normalized request path: a
+// leading slash (or several) must not change the outcome for any operation.
+func TestACL_UniformNormalizationAcrossOperations(t *testing.T) {
+	t.Parallel()
+
+	acl := testACLFromRules(t, `
+path "secret/uniform" {
+	capabilities = ["create", "read", "update", "delete", "list"]
+}
+`)
+
+	ops := []logical.Operation{
+		logical.CreateOperation,
+		logical.ReadOperation,
+		logical.UpdateOperation,
+		logical.DeleteOperation,
+	}
+	for _, op := range ops {
+		op := op
+		t.Run(string(op), func(t *testing.T) {
+			t.Parallel()
+			for _, path := range []string{"secret/uniform", "/secret/uniform", "//secret/uniform"} {
+				require.True(t, testACLAllowed(t, acl, op, path), "op=%s path=%q", op, path)
+			}
+			// The same normalization applies to denials: an adjacent path must
+			// stay denied however many leading slashes it carries.
+			for _, path := range []string{"secret/uniform2", "/secret/uniform2", "//secret/uniform2"} {
+				require.False(t, testACLAllowed(t, acl, op, path), "op=%s path=%q", op, path)
+			}
+		})
+	}
+
+	t.Run("list", func(t *testing.T) {
+		t.Parallel()
+		for _, path := range []string{"secret/uniform/", "/secret/uniform/", "//secret/uniform/"} {
+			require.True(t, testACLAllowed(t, acl, logical.ListOperation, path), "path=%q", path)
+		}
+		for _, path := range []string{"secret/uniform2/", "/secret/uniform2/", "//secret/uniform2/"} {
+			require.False(t, testACLAllowed(t, acl, logical.ListOperation, path), "path=%q", path)
+		}
+	})
+}
+
+// TestACL_ListBoundaries exercises LIST requests at the edges of a prefix
+// rule: the listable directory itself, its slash-less form, adjacent names,
+// and children.
+func TestACL_ListBoundaries(t *testing.T) {
+	t.Parallel()
+
+	acl := testACLFromRules(t, `
+path "secret/foo/*" {
+	capabilities = ["list"]
+}
+path "secret/+" {
+	capabilities = ["read"]
+}
+`)
+
+	cases := []struct {
+		name    string
+		path    string
+		allowed bool
+	}{
+		{"list own directory", "secret/foo/", true},
+		{"list own directory slash-less", "secret/foo", false},
+		{"list adjacent name", "secret/foobar/", false},
+		{"list adjacent name slash-less", "secret/foobar", false},
+		{"list child directory", "secret/foo/bar/", true},
+		{"list unrelated", "other/foo/", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.allowed, testACLAllowed(t, acl, logical.ListOperation, tc.path),
+				"path=%q", tc.path)
+		})
+	}
+}
+
+// TestACL_ConcurrentPolicyUpdates hammers a PolicyStore with concurrent
+// policy updates and ACL evaluations to verify that a policy swap is atomic
+// with respect to authorization decisions: every evaluation must observe a
+// consistent snapshot (either the old or the new policy) and must never
+// race, error, or panic. Run with -race for the full benefit.
+func TestACL_ConcurrentPolicyUpdates(t *testing.T) {
+	core, _, _ := TestCoreUnsealed(t)
+	ps := core.policyStore
+	ctx := namespace.RootContext(context.Background())
+
+	allowRules := `
+name = "race-test"
+path "secret/race/*" {
+	capabilities = ["read"]
+}
+`
+	denyRules := `
+name = "race-test"
+path "secret/race/*" {
+	capabilities = ["deny"]
+}
+`
+
+	allowPolicy, err := ParseACLPolicy(namespace.RootNamespace, allowRules)
+	require.NoError(t, err)
+	denyPolicy, err := ParseACLPolicy(namespace.RootNamespace, denyRules)
+	require.NoError(t, err)
+
+	require.NoError(t, ps.SetPolicy(ctx, allowPolicy))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	errs := make(chan error, 64)
+
+	// Writers alternate between the allow and deny versions of the policy.
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				p := allowPolicy
+				if i%2 == 1 {
+					p = denyPolicy
+				}
+				if err := ps.SetPolicy(ctx, p); err != nil {
+					select {
+					case errs <- fmt.Errorf("set policy: %w", err):
+					default:
+					}
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Readers compile fresh ACLs from the store and evaluate requests against
+	// them. Any consistent snapshot is acceptable; a torn one is not.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := &logical.Request{
+				Operation: logical.ReadOperation,
+				Path:      "secret/race/item",
+			}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				acl, err := ps.ACL(ctx, nil, map[string][]string{namespace.RootNamespaceID: {"race-test"}})
+				if err != nil {
+					select {
+					case errs <- fmt.Errorf("acl: %w", err):
+					default:
+					}
+					return
+				}
+				res := acl.AllowOperation(ctx, req, false)
+				if res == nil {
+					select {
+					case errs <- fmt.Errorf("nil ACL results"):
+					default:
+					}
+					return
+				}
+				// The decision itself may be allow or deny depending on which
+				// snapshot was observed; both are valid. Capabilities must
+				// agree with the decision either way.
+				caps := acl.Capabilities(ctx, "secret/race/item")
+				if res.Allowed {
+					require.Contains(t, caps, ReadCapability)
+				} else {
+					require.NotContains(t, caps, ReadCapability)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(2 * time.Second)
+	close(stop)
+	wg.Wait()
+
+	select {
+	case err := <-errs:
+		t.Fatalf("err: %v", err)
+	default:
+	}
+}
